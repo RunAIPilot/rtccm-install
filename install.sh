@@ -83,11 +83,18 @@ fi
 mkdir -p secrets
 umask 077
 
-# Generate grafana admin password if missing
+# Generate grafana admin password if missing. Use 0444 so the
+# non-root grafana user inside the container (uid 472) can read it —
+# docker-compose bind-mounts secret files with host permissions and
+# does not honor the 'mode:' key outside swarm mode.
 if [ ! -f secrets/grafana_admin_password.txt ]; then
   openssl rand -base64 32 > secrets/grafana_admin_password.txt
-  chmod 600 secrets/grafana_admin_password.txt
+  chmod 0444 secrets/grafana_admin_password.txt
   green "Generated secrets/grafana_admin_password.txt"
+fi
+# Belt-and-braces: if a previous install created the file at 600, relax it.
+if [ -f secrets/grafana_admin_password.txt ]; then
+  chmod 0444 secrets/grafana_admin_password.txt
 fi
 
 # Mirror postgres password from .secrets.env to secrets/postgres_password.txt
@@ -144,6 +151,8 @@ for f in aws_credentials.json azure_credentials.json gcp_credentials.json oci_cr
 done
 chmod 600 secrets/*.json secrets/*.txt 2>/dev/null || true
 chmod 644 secrets/license_public_key.pem 2>/dev/null || true
+# Grafana runs as uid 472 and needs the admin password readable
+chmod 0444 secrets/grafana_admin_password.txt 2>/dev/null || true
 
 # ─── Pull and start ─────────────────────────────────────────────────────────
 green "Pulling cletrics/rtccm-* images from Docker Hub..."
