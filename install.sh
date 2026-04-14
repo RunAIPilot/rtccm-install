@@ -7,13 +7,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+MIN_DISK_GB=25
+
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 green(){ printf '\033[32m%s\033[0m\n' "$*"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
 
-# ─── Pre-flight checks ──────────────────────────────────────────────────────
+# ─── Pre-flight: docker ─────────────────────────────────────────────────────
 command -v docker >/dev/null || { red "docker is not installed. Install Docker Engine 24+ first."; exit 1; }
 docker compose version >/dev/null 2>&1 || { red "docker compose plugin is missing. Install docker-compose-plugin."; exit 1; }
+command -v python3 >/dev/null || { red "python3 is not installed. Install python3 to continue."; exit 1; }
 
 DOCKER_VERSION="$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 0.0.0)"
 DOCKER_MAJOR="${DOCKER_VERSION%%.*}"
@@ -21,19 +24,41 @@ if [ "${DOCKER_MAJOR:-0}" -lt 24 ]; then
   yellow "WARNING: Docker $DOCKER_VERSION detected. Minimum recommended: 24.0"
 fi
 
-# ─── Template expansion ─────────────────────────────────────────────────────
+# ─── Pre-flight: disk space ─────────────────────────────────────────────────
+# RTCCM needs roughly 10 GB for image layers + 15 GB for first-month runtime
+# state. Check the docker data root, not the install dir — images and volumes
+# land there.
+DOCKER_ROOT="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)"
+FREE_KB="$(df -k --output=avail "$DOCKER_ROOT" 2>/dev/null | tail -1 | tr -d ' ')"
+if [ -n "$FREE_KB" ]; then
+  FREE_GB=$((FREE_KB / 1024 / 1024))
+  if [ "$FREE_GB" -lt "$MIN_DISK_GB" ]; then
+    red "ERROR: only ${FREE_GB} GB free on $DOCKER_ROOT — RTCCM needs at least ${MIN_DISK_GB} GB."
+    red "Resize the volume or run 'docker system prune -a' to free space, then retry."
+    exit 1
+  fi
+fi
+
+# ─── Template expansion (single pass) ───────────────────────────────────────
+CREATED_TEMPLATE=0
 if [ ! -f .env ]; then
   cp env-template.txt .env
-  yellow "Created .env from template. Edit it before running install.sh again."
-  yellow "Edit: \$EDITOR $SCRIPT_DIR/.env"
-  exit 0
+  yellow "Created .env from template."
+  CREATED_TEMPLATE=1
 fi
 
 if [ ! -f .secrets.env ]; then
   cp secrets-template.env .secrets.env
   chmod 600 .secrets.env
-  yellow "Created .secrets.env from template. Edit it before running install.sh again."
-  yellow "Edit: \$EDITOR $SCRIPT_DIR/.secrets.env"
+  yellow "Created .secrets.env from template (chmod 600)."
+  CREATED_TEMPLATE=1
+fi
+
+if [ "$CREATED_TEMPLATE" = "1" ]; then
+  yellow ""
+  yellow "Edit both files before re-running install.sh:"
+  yellow "  \$EDITOR $SCRIPT_DIR/.env"
+  yellow "  \$EDITOR $SCRIPT_DIR/.secrets.env"
   exit 0
 fi
 
@@ -43,6 +68,14 @@ if grep -q "CHANGEME_" .env .secrets.env 2>/dev/null; then
   red "One or more CHANGEME_ placeholders remain in .env or .secrets.env."
   red "Edit those files and replace placeholders before running install."
   grep -l "CHANGEME_" .env .secrets.env
+  exit 1
+fi
+
+# Catch REPLACE_WITH_ placeholders in the DATABASE_URL style values.
+if grep -q "REPLACE_WITH_" .env 2>/dev/null; then
+  red "One or more REPLACE_WITH_ placeholders remain in .env."
+  red "Edit .env and fill in the real values before running install."
+  grep -n "REPLACE_WITH_" .env
   exit 1
 fi
 
@@ -71,9 +104,11 @@ if [ ! -f secrets/clickhouse_password.txt ] && grep -q "^CLICKHOUSE_PASSWORD=" .
   green "Mirrored CLICKHOUSE_PASSWORD to secrets/clickhouse_password.txt"
 fi
 
-# Mirror encryption key (as raw bytes — the compose expects .bin)
+# Mirror encryption key (hex → raw bytes) via python3 so we don't depend on xxd
+# which is not installed on minimal Ubuntu/Debian.
 if [ ! -f secrets/clickhouse_encryption_key.bin ] && grep -q "^CLICKHOUSE_ENCRYPTION_KEY=" .secrets.env; then
-  grep "^CLICKHOUSE_ENCRYPTION_KEY=" .secrets.env | cut -d= -f2- | xxd -r -p > secrets/clickhouse_encryption_key.bin
+  HEX_KEY="$(grep "^CLICKHOUSE_ENCRYPTION_KEY=" .secrets.env | cut -d= -f2-)"
+  python3 -c "import sys; open('secrets/clickhouse_encryption_key.bin','wb').write(bytes.fromhex('$HEX_KEY'.strip()))"
   chmod 600 secrets/clickhouse_encryption_key.bin
   green "Mirrored CLICKHOUSE_ENCRYPTION_KEY to secrets/clickhouse_encryption_key.bin"
 fi

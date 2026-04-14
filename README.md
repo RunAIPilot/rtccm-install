@@ -6,13 +6,41 @@ This repository contains the **customer install manifest** only — Docker Compo
 
 ## Requirements
 
-- Linux host with Docker Engine 24.0+ and the `docker compose` plugin
-- ~8 GB RAM, ~50 GB disk (more for long-term metrics history)
-- Outbound HTTPS to `hub.docker.com` for image pulls
-- One or more of:
-  - AWS account with Cost and Usage Report (CUR) export enabled
-  - Azure AD app registration with Cost Management Reader role
-  - GCP service account with BigQuery Billing Data Transfer access
+**Host**
+
+- Linux with kernel 5.4+ (Ubuntu 20.04+, Debian 11+, RHEL 9+)
+- Docker Engine 24.0+
+- `docker compose` plugin (v2)
+- `python3` (used by `install.sh` for secret generation)
+
+**Resources**
+
+| | Minimum | Recommended |
+|---|---|---|
+| CPU | 4 vCPU | 8 vCPU |
+| RAM | 8 GB | 16 GB |
+| Disk | **25 GB free** on the docker data root | 80+ GB |
+
+Disk breakdown at minimum:
+
+| Phase | Disk |
+|---|---|
+| Image pull + extract (`cletrics/rtccm-*:1.3.0` × 10) | ~10 GB |
+| First-month postgres + clickhouse + VictoriaMetrics state | ~15 GB |
+| **Total minimum free** | **~25 GB** |
+
+Plan for 25–50 GB additional headroom per year of metric retention. `install.sh` will refuse to continue if the docker data root (`/var/lib/docker` by default) has less than 25 GB free.
+
+**Network**
+
+- Outbound HTTPS (443) to `hub.docker.com`, `registry-1.docker.io`, `auth.docker.io` for image pulls
+- Plus the cloud APIs for whichever profiles you enable (AWS EC2/CUR/Pricing, Azure Resource Manager/Cost Management, GCP BigQuery/Cloud Billing)
+
+**Cloud prerequisites** (one or more)
+
+- AWS account with a Cost and Usage Report (CUR) export enabled in Parquet
+- Azure AD app registration with Cost Management Reader role on each tracked subscription
+- GCP service account with BigQuery read access to the billing export dataset
 
 ## Quickstart
 
@@ -22,7 +50,7 @@ cd rtccm
 ./install.sh
 ```
 
-First run creates `.env` and `.secrets.env` from templates and exits. Edit both files, then re-run `./install.sh` to pull images and start the stack.
+First run creates both `.env` and `.secrets.env` from templates and exits. Edit both files, then re-run `./install.sh` to pull images and start the stack.
 
 ## Cloud profiles
 
