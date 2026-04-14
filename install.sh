@@ -79,6 +79,19 @@ if grep -q "REPLACE_WITH_" .env 2>/dev/null; then
   exit 1
 fi
 
+# Auto-generate RTCCM_ADMIN_KEY if not set. This is the bootstrap API
+# key used to log into the UI via "Login with API Key" on a fresh
+# install (no users in the DB yet). Once real user accounts exist
+# you can blank this out and restart the api.
+if ! grep -qE "^RTCCM_ADMIN_KEY=[^[:space:]]+" .secrets.env 2>/dev/null; then
+  NEW_ADMIN_KEY="$(openssl rand -hex 32)"
+  # Remove any blank RTCCM_ADMIN_KEY line first, then append the new one
+  sed -i '/^RTCCM_ADMIN_KEY=/d' .secrets.env 2>/dev/null || true
+  echo "RTCCM_ADMIN_KEY=$NEW_ADMIN_KEY" >> .secrets.env
+  green "Generated RTCCM_ADMIN_KEY (stored in .secrets.env)"
+  GENERATED_ADMIN_KEY="$NEW_ADMIN_KEY"
+fi
+
 # ─── Secrets directory ──────────────────────────────────────────────────────
 mkdir -p secrets
 umask 077
@@ -166,5 +179,27 @@ echo
 echo "Next steps:"
 echo "  1. Watch containers come healthy:   docker compose ps"
 echo "  2. Tail logs for any failures:      docker compose logs -f --tail=50"
-echo "  3. Open the web UI:                 http://\${RTCCM_HOST:-localhost}:\${WEB_PORT:-5173}"
-echo "  4. First visit prompts for admin account creation."
+echo
+
+# Load RTCCM_HOST and WEB_PORT from .env so we can print a real URL
+RTCCM_HOST_VAL="$(grep -E "^RTCCM_HOST=" .env | cut -d= -f2- | tr -d '"' )"
+WEB_PORT_VAL="$(grep -E "^WEB_PORT=" .env | cut -d= -f2- | tr -d '"' )"
+RTCCM_HOST_VAL="${RTCCM_HOST_VAL:-localhost}"
+WEB_PORT_VAL="${WEB_PORT_VAL:-5173}"
+
+echo "  3. Open the web UI:                 http://${RTCCM_HOST_VAL}:${WEB_PORT_VAL}/"
+echo
+
+# Fresh install → no user accounts in the DB yet → customer must log in
+# via the API-key path and create real users afterwards.
+ADMIN_KEY_VAL="$(grep -E "^RTCCM_ADMIN_KEY=" .secrets.env 2>/dev/null | cut -d= -f2-)"
+if [ -n "$ADMIN_KEY_VAL" ]; then
+  yellow "  4. First-time login (no user accounts exist yet):"
+  yellow "       - On the login page, click 'Login with API Key' under Developer Access"
+  yellow "       - Paste this bootstrap key:"
+  yellow ""
+  yellow "           $ADMIN_KEY_VAL"
+  yellow ""
+  yellow "     Then create real users in Settings > Users and blank out"
+  yellow "     RTCCM_ADMIN_KEY in .secrets.env for day-to-day operation."
+fi
