@@ -1,0 +1,70 @@
+# OTel Collector — AWS CloudWatch metrics via YACE sidecar
+# Ticket #1009: Fix crash loop — awscloudwatch receiver is logs-only,
+# does not support 'metrics' key. Replaced with prometheus receiver
+# scraping YACE (Yet Another CloudWatch Exporter) on port 5000.
+# Ticket #1018: Verified metric naming matches dashboard queries
+#
+# Services: EC2, RDS, ALB, ELB, Lambda, NAT Gateway, S3, EKS, CloudWatch Logs
+# Exports OTLP to the gateway
+
+receivers:
+  # Scrape YACE Prometheus endpoint for CloudWatch metrics
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: yace
+          scrape_interval: 300s  # Match YACE poll interval (5m)
+          static_configs:
+            - targets: ["aws-yace:5000"]
+
+processors:
+  batch:
+    send_batch_size: 5000
+    timeout: 5s
+
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+
+  attributes:
+    actions:
+      - key: provider
+        value: "aws"
+        action: upsert
+
+  resource:
+    attributes:
+      - key: cloud.provider
+        value: "aws"
+        action: upsert
+      - key: rtccm.collector
+        value: "aws"
+        action: upsert
+
+exporters:
+  otlp:
+    endpoint: rtccm-otel-gateway:4317
+    tls:
+      ca_file: /certs/ca.pem
+      cert_file: /certs/collector.pem
+      key_file: /certs/collector-key.pem
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  telemetry:
+    logs:
+      level: info
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [memory_limiter, attributes, resource, batch]
+      exporters: [otlp]

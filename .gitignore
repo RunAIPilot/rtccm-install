@@ -1,0 +1,5 @@
+# Customer runtime state — never commit
+.env
+.secrets.env
+secrets/
+data/

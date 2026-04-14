@@ -1,0 +1,179 @@
+# OTel Collector — GCP Cloud Monitoring receiver
+# Collects 6 MVP service categories (35 individual metrics) from Google Cloud Monitoring
+# Exports OTLP to the gateway
+#
+# MVP Services:
+#   1. BigQuery — slot utilization, bytes processed, storage
+#   2. Cloud Logging — ingestion volume, log bytes
+#   3. Compute Engine — CPU utilization, instance uptime, disk IOPS
+#   4. Cloud Run / Cloud Functions — invocations, execution time, egress
+#   5. GKE — node CPU/memory, pod count, egress
+#   6. Cloud Storage — request counts, storage size, egress
+
+receivers:
+  # GCP Cloud Monitoring metrics receiver
+  # Authenticates via GOOGLE_APPLICATION_CREDENTIALS env var (service account JSON)
+  googlecloudmonitoring:
+    project_id: ${env:GCP_PROJECT_ID}
+    collection_interval: 60s
+    metrics_list:
+      # ─── 1. BigQuery ──────────────────────────────────────────────
+      # Slot utilization — primary cost driver for flat-rate/editions pricing
+      - metric_name: "bigquery.googleapis.com/slots/total_available"
+      - metric_name: "bigquery.googleapis.com/slots/allocated_for_project"
+      # Bytes processed — primary cost driver for on-demand pricing
+      - metric_name: "bigquery.googleapis.com/query/scanned_bytes"
+      - metric_name: "bigquery.googleapis.com/query/scanned_bytes_billed"
+      # Storage — active + long-term storage costs
+      - metric_name: "bigquery.googleapis.com/storage/stored_bytes"
+      - metric_name: "bigquery.googleapis.com/storage/table_count"
+
+      # ─── 2. Cloud Logging ─────────────────────────────────────────
+      # Ingestion volume — $0.50/GiB after free tier, biggest surprise cost
+      - metric_name: "logging.googleapis.com/billing/monthly_bytes_ingested"
+      - metric_name: "logging.googleapis.com/byte_count"
+      - metric_name: "logging.googleapis.com/log_entry_count"
+      # Exports (sink-based routing) contribute to egress costs
+      - metric_name: "logging.googleapis.com/exports/byte_count"
+
+      # ─── 3. Compute Engine ────────────────────────────────────────
+      # CPU utilization — right-sizing signal & sustained-use discount qualifier
+      - metric_name: "compute.googleapis.com/instance/cpu/utilization"
+      # Instance uptime — running hours determine cost
+      - metric_name: "compute.googleapis.com/instance/uptime"
+      # Disk IOPS — provisioned IOPS cost on pd-ssd
+      - metric_name: "compute.googleapis.com/instance/disk/read_ops_count"
+      - metric_name: "compute.googleapis.com/instance/disk/write_ops_count"
+      # Network — egress is a significant cost driver
+      - metric_name: "compute.googleapis.com/instance/network/received_bytes_count"
+      - metric_name: "compute.googleapis.com/instance/network/sent_bytes_count"
+      # Guest memory — requires Google Cloud Ops Agent installed on VM.
+      # Metric will be empty for VMs without the agent (no errors, just no data).
+      - metric_name: "compute.googleapis.com/instance/guest/memory/bytes_used"
+
+      # ─── 4. Cloud Run / Cloud Functions ────────────────────────────
+      # Cloud Run
+      - metric_name: "run.googleapis.com/request_count"
+      - metric_name: "run.googleapis.com/container/billable_instance_time"
+      - metric_name: "run.googleapis.com/container/cpu/utilizations"
+      - metric_name: "run.googleapis.com/container/memory/utilizations"
+      - metric_name: "run.googleapis.com/container/network/sent_bytes_count"
+      # Cloud Functions (v2 backed by Cloud Run, v1 legacy)
+      - metric_name: "cloudfunctions.googleapis.com/function/execution_count"
+      - metric_name: "cloudfunctions.googleapis.com/function/execution_times"
+      - metric_name: "cloudfunctions.googleapis.com/function/network_egress"
+
+      # ─── 5. GKE ──────────────────────────────────────────────────
+      # Node-level CPU/memory — cluster right-sizing signal
+      - metric_name: "kubernetes.io/node/cpu/allocatable_utilization"
+      - metric_name: "kubernetes.io/node/memory/allocatable_utilization"
+      # Pod count — scaling signal for cost correlation
+      - metric_name: "kubernetes.io/container/cpu/usage_time"
+      - metric_name: "kubernetes.io/container/memory/used_bytes"
+      - metric_name: "kubernetes.io/pod/network/sent_bytes_count"
+      - metric_name: "kubernetes.io/pod/network/received_bytes_count"
+
+      # ─── 6. Cloud Storage ─────────────────────────────────────────
+      # Request counts — Class A/B operation pricing
+      - metric_name: "storage.googleapis.com/api/request_count"
+      # Storage size — per-GB-month cost varies by storage class
+      - metric_name: "storage.googleapis.com/storage/total_bytes"
+      - metric_name: "storage.googleapis.com/storage/object_count"
+      # Egress — significant cost for cross-region / internet egress
+      - metric_name: "storage.googleapis.com/network/sent_bytes_count"
+      - metric_name: "storage.googleapis.com/network/received_bytes_count"
+      # Error rates — wasted API operations (billed but unsuccessful)
+      - metric_name: "storage.googleapis.com/api/server_error_rate"
+      - metric_name: "storage.googleapis.com/api/client_error_rate"
+
+      # ─── 7. Cloud NAT ────────────────────────────────────────────
+      # NAT data processing fees are per-GB for both egress and ingress
+      - metric_name: "router.googleapis.com/nat/sent_bytes_count"
+      - metric_name: "router.googleapis.com/nat/received_bytes_count"
+
+      # ─── 8. Cloud Interconnect ───────────────────────────────────
+      # Interconnect egress charges differ from standard internet egress
+      - metric_name: "networking.googleapis.com/interconnect/attachment/sent_bytes_count"
+
+      # ─── 9. Cloud Spanner ────────────────────────────────────────
+      # Spanner bills on Processing Units (PUs). Request volume drives PU requirements.
+      - metric_name: "spanner.googleapis.com/api/api_request_count"
+      - metric_name: "spanner.googleapis.com/api/request_latencies"
+
+processors:
+  batch:
+    send_batch_size: 5000
+    timeout: 5s
+
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+
+  # GCP-specific label normalization
+  # Maps GCP-native labels to RTCCM unified schema
+  attributes:
+    actions:
+      # Provider tag
+      - key: provider
+        value: "gcp"
+        action: upsert
+      # Normalize project_id → account (RTCCM standard)
+      - key: account
+        from_attribute: gcp.project_id
+        action: upsert
+      - key: account
+        from_attribute: project_id
+        action: upsert
+      # Normalize account_id (gateway expects this)
+      - key: account_id
+        from_attribute: gcp.project_id
+        action: upsert
+      - key: account_id
+        from_attribute: project_id
+        action: upsert
+      # Normalize zone → region (strip zone suffix: us-central1-a → us-central1)
+      - key: region
+        from_attribute: cloud.availability_zone
+        action: upsert
+      - key: region
+        from_attribute: zone
+        action: upsert
+
+  resource:
+    attributes:
+      - key: cloud.provider
+        value: "gcp"
+        action: upsert
+      - key: rtccm.collector
+        value: "gcp"
+        action: upsert
+
+exporters:
+  otlp:
+    endpoint: rtccm-otel-gateway:4317
+    tls:
+      ca_file: /certs/ca.pem
+      cert_file: /certs/collector.pem
+      key_file: /certs/collector-key.pem
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      address: 0.0.0.0:8888
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [googlecloudmonitoring]
+      processors: [memory_limiter, attributes, resource, batch]
+      exporters: [otlp]

@@ -1,0 +1,82 @@
+# OTel Collector — Azure Monitor receiver
+# Collects 6 MVP high-variance cost drivers from Azure Monitor
+# Exports OTLP to the gateway
+
+receivers:
+  azuremonitor:
+    subscription_id: ${env:AZURE_SUBSCRIPTION_ID}
+    auth: service_principal
+    tenant_id: ${env:AZURE_TENANT_ID}
+    client_id: ${env:AZURE_CLIENT_ID}
+    client_secret: ${env:AZURE_CLIENT_SECRET}
+    cloud: AzureCloud
+    resource_groups: []
+    services:
+      - "Microsoft.Compute/virtualMachines"
+      - "Microsoft.Storage/storageAccounts"
+      - "Microsoft.Sql/servers/databases"
+      - "Microsoft.ContainerService/managedClusters"
+      - "Microsoft.Network/natGateways"
+      - "Microsoft.OperationalInsights/workspaces"
+      - "Microsoft.Compute/virtualMachineScaleSets"
+      - "Microsoft.App/containerApps"
+    collection_interval: 60s
+    initial_delay: 1s
+    cache_resources: 86400
+    cache_resources_definitions: 86400
+    maximum_number_of_metrics_in_a_call: 20
+
+processors:
+  batch:
+    send_batch_size: 5000
+    timeout: 5s
+
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+
+  attributes:
+    actions:
+      - key: provider
+        value: "azure"
+        action: upsert
+      - key: subscription_id
+        from_attribute: azure.subscription_id
+        action: upsert
+
+  resource:
+    attributes:
+      - key: cloud.provider
+        value: "azure"
+        action: upsert
+      - key: rtccm.collector
+        value: "azure"
+        action: upsert
+
+exporters:
+  otlp:
+    endpoint: rtccm-otel-gateway:4317
+    tls:
+      ca_file: /certs/ca.pem
+      cert_file: /certs/collector.pem
+      key_file: /certs/collector-key.pem
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  telemetry:
+    logs:
+      level: debug
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [azuremonitor]
+      processors: [memory_limiter, attributes, resource, batch]
+      exporters: [otlp]

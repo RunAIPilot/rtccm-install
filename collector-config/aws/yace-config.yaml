@@ -1,0 +1,298 @@
+# YACE (Yet Another CloudWatch Exporter) — AWS CloudWatch metrics
+# Replaces the non-existent awscloudwatchmetrics OTel receiver
+# Ticket #1009: Fix AWS OTel Collector crash loop
+# Ticket #1018: Ensure metric names match cost-efficiency dashboard queries
+#
+# YACE metric naming convention:
+#   aws_{namespace}_{metricname_lowercase}_{statistic}
+# Example: AWS/EC2 CPUUtilization Average -> aws_ec2_cpuutilization_average
+#
+# Uses customNamespace mode to query CloudWatch metrics directly
+# without requiring AWS resource tagging.
+
+apiVersion: v1alpha1
+sts-region: us-east-1
+
+customNamespace:
+  # ─── EC2 ──────────────────────────────────────────────
+  - namespace: AWS/EC2
+    name: ec2
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - InstanceId
+    metrics:
+      - name: CPUUtilization
+        statistics: [Average]
+      - name: NetworkIn
+        statistics: [Sum]
+      - name: NetworkOut
+        statistics: [Sum]
+      - name: DiskReadOps
+        statistics: [Sum]
+      - name: DiskWriteOps
+        statistics: [Sum]
+      - name: StatusCheckFailed
+        statistics: [Sum]
+      - name: CPUCreditUsage
+        statistics: [Sum]
+      - name: CPUCreditBalance
+        statistics: [Average]
+      - name: CPUSurplusCreditBalance
+        statistics: [Average]
+
+  # ─── EBS ──────────────────────────────────────────────
+  - namespace: AWS/EBS
+    name: ebs
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - VolumeId
+    metrics:
+      - name: VolumeReadOps
+        statistics: [Sum]
+      - name: VolumeWriteOps
+        statistics: [Sum]
+      - name: VolumeReadBytes
+        statistics: [Sum]
+      - name: VolumeWriteBytes
+        statistics: [Sum]
+      - name: VolumeQueueLength
+        statistics: [Average]
+      - name: BurstBalance
+        statistics: [Minimum]
+
+  # ─── DynamoDB ──────────────────────────────────────────
+  - namespace: AWS/DynamoDB
+    name: dynamodb
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - TableName
+    metrics:
+      - name: ConsumedReadCapacityUnits
+        statistics: [Sum]
+      - name: ConsumedWriteCapacityUnits
+        statistics: [Sum]
+      - name: ProvisionedReadCapacityUnits
+        statistics: [Average]
+      - name: ProvisionedWriteCapacityUnits
+        statistics: [Average]
+
+  # ─── RDS ──────────────────────────────────────────────
+  - namespace: AWS/RDS
+    name: rds
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - DBInstanceIdentifier
+    metrics:
+      - name: CPUUtilization
+        statistics: [Average]
+      - name: DatabaseConnections
+        statistics: [Average]
+      - name: ReadIOPS
+        statistics: [Average]
+      - name: WriteIOPS
+        statistics: [Average]
+      - name: FreeStorageSpace
+        statistics: [Average]
+      - name: FreeableMemory
+        statistics: [Average]
+      - name: ServerlessDatabaseCapacity
+        statistics: [Average]
+      - name: ACUUtilization
+        statistics: [Average]
+
+  # ─── Application ELB (ALB) ────────────────────────────
+  - namespace: AWS/ApplicationELB
+    name: applicationelb
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - LoadBalancer
+    metrics:
+      - name: RequestCount
+        statistics: [Sum]
+      - name: TargetResponseTime
+        statistics: [Average]
+      - name: HTTPCode_Target_5XX_Count
+        statistics: [Sum]
+
+  # ─── Classic ELB ──────────────────────────────────────
+  - namespace: AWS/ELB
+    name: elb
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - LoadBalancerName
+    metrics:
+      - name: RequestCount
+        statistics: [Sum]
+
+  # ─── Lambda ───────────────────────────────────────────
+  - namespace: AWS/Lambda
+    name: lambda
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - FunctionName
+    metrics:
+      - name: Invocations
+        statistics: [Sum]
+      - name: Errors
+        statistics: [Sum]
+      - name: Throttles
+        statistics: [Sum]
+      - name: Duration
+        statistics: [Average]
+      - name: ConcurrentExecutions
+        statistics: [Maximum]
+
+  # ─── NAT Gateway ─────────────────────────────────────
+  - namespace: AWS/NATGateway
+    name: natgateway
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - NatGatewayId
+    metrics:
+      - name: BytesInFromSource
+        statistics: [Sum]
+      - name: BytesOutToDestination
+        statistics: [Sum]
+      - name: PacketsDropCount
+        statistics: [Sum]
+
+  # ─── S3 (daily metrics — longer period) ──────────────
+  - namespace: AWS/S3
+    name: s3
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 86400
+    length: 172800
+    dimensionNameRequirements:
+      - BucketName
+      - StorageType
+    metrics:
+      - name: BucketSizeBytes
+        statistics: [Average]
+      - name: NumberOfObjects
+        statistics: [Average]
+      # AllRequests requires a CloudWatch metrics configuration (request metrics filter)
+      # enabled on each S3 bucket. Without it, YACE returns no data for this metric.
+      # The FilterId dimension is set by the filter — YACE discovers it automatically.
+      - name: AllRequests
+        statistics: [Sum]
+
+  # ─── EKS (Container Insights) ───────────────────────
+  - namespace: ContainerInsights
+    name: eks
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - ClusterName
+    metrics:
+      - name: node_cpu_utilization
+        statistics: [Average]
+      - name: node_memory_utilization
+        statistics: [Average]
+      - name: pod_cpu_utilization
+        statistics: [Average]
+      - name: pod_memory_utilization
+        statistics: [Average]
+
+  # ─── CloudWatch Logs ────────────────────────────────
+  - namespace: AWS/Logs
+    name: logs
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - LogGroupName
+    metrics:
+      - name: IncomingBytes
+        statistics: [Sum]
+      - name: IncomingLogEvents
+        statistics: [Sum]
+
+  # ─── SageMaker (ML instance utilization) ─────────────
+  - namespace: AWS/SageMaker
+    name: sagemaker
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - EndpointName
+      - VariantName
+    metrics:
+      - name: CPUUtilization
+        statistics: [Average]
+      - name: MemoryUtilization
+        statistics: [Average]
+      - name: GPUMemoryUtilization
+        statistics: [Average]
+
+  # ─── ECS / Fargate ───────────────────────────────────
+  - namespace: AWS/ECS
+    name: ecs
+    regions:
+      - us-east-1
+      - us-east-2
+    period: 300
+    length: 600
+    dimensionNameRequirements:
+      - ClusterName
+      - ServiceName
+    metrics:
+      - name: CPUUtilization
+        statistics: [Average]
+      - name: MemoryUtilization
+        statistics: [Average]
+
+  # ─── Billing (account-level estimate) ────────────────
+  # EstimatedCharges is only available in us-east-1.
+  # Requires billing alerts enabled in the AWS account.
+  # Period is 6 hours to match AWS billing update frequency.
+  - namespace: AWS/Billing
+    name: billing
+    regions:
+      - us-east-1
+    period: 21600
+    length: 43200
+    dimensionNameRequirements: []
+    metrics:
+      - name: EstimatedCharges
+        statistics: [Maximum]

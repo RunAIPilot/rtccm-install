@@ -1,0 +1,1249 @@
+# RTCCM -- Real-Time Cloud Cost Metrics
+# Customer install manifest (release 1.3.0)
+#
+# Images: cletrics/rtccm-* from hub.docker.com/u/cletrics
+# Source: https://github.com/RunAIPilot/rtccm-install
+#
+# Usage:
+#   Single cloud:   docker compose --profile azure up -d
+#   Multi-cloud:    docker compose --profile azure --profile aws up -d
+#   All clouds:     docker compose --profile azure --profile aws --profile gcp up -d
+#
+# Before first run: cp env-template.txt .env && edit .env
+#                   cp secrets-template.env .secrets.env && edit .secrets.env
+
+name: rtccm
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# Secrets env file — contains DATABASE_URL, cloud credentials, etc.
+# Services that need secrets should include: env_file: [.secrets.env]
+x-secrets-env: &secrets-env
+  env_file:
+    - .secrets.env
+
+networks:
+  rtccm-internal:
+    driver: bridge
+    internal: true
+  rtccm-external:
+    driver: bridge
+
+volumes:
+  victoriametrics-data:
+  rtccm-postgres-data:
+  grafana-data:
+  infracost-postgres-data:
+  rtccm-config:
+  clickhouse-data:
+  tls-certs:  # Shared volume for automated PKI (Ticket #223)
+
+services:
+  # --- Certificate Manager (Ticket #223: Automated PKI) ---
+  # Generates and auto-rotates mTLS certificates for all services.
+  # Replaces manual generate_certs.sh execution.
+  cert-manager:
+    <<: *common
+    image: cletrics/rtccm-api:${RTCCM_VERSION:-latest}
+    container_name: rtccm-cert-manager
+    user: "0:0"
+    entrypoint: ["python", "-m", "api.cert_manager"]
+    volumes:
+      - tls-certs:/certs:rw
+    environment:
+      CERT_MANAGER_TLS_DIR: /certs
+      CERT_MANAGER_SERVICES: api,postgres,grafana,collector
+      CERT_MANAGER_CA_DAYS: "3650"
+      CERT_MANAGER_CERT_DAYS: "${CERT_MANAGER_CERT_DAYS:-90}"
+      CERT_MANAGER_RENEWAL_DAYS: "${CERT_MANAGER_RENEWAL_DAYS:-30}"
+      CERT_MANAGER_CHECK_INTERVAL: "${CERT_MANAGER_CHECK_INTERVAL:-43200}"
+    networks:
+      - rtccm-internal
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /certs/ca.pem && test -f /certs/api.pem"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+  # --- Core Services (always on) ---
+
+  postgres:
+    <<: *common
+    image: cletrics/rtccm-postgres:${RTCCM_VERSION:-latest}
+    container_name: rtccm-postgres
+    environment:
+      POSTGRES_DB: rtccm
+      POSTGRES_USER: rtccm
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - rtccm-postgres-data:/var/lib/postgresql/data
+      - tls-certs:/certs:ro
+    networks:
+      - rtccm-internal
+    ports:
+      - "127.0.0.1:5432:5432"
+    depends_on:
+      cert-manager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rtccm -d rtccm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  victoriametrics:
+    <<: *common
+    image: victoriametrics/victoria-metrics:v1.109.0
+    container_name: rtccm-victoriametrics
+    command:
+      - "--storageDataPath=/victoria-metrics-data"
+      - "--retentionPeriod=90d"
+      - "--httpListenAddr=:8428"
+      - "--search.latencyOffset=5s"
+      - "--search.maxStalenessInterval=20m"
+      - "--dedup.minScrapeInterval=30s"
+    volumes:
+      - victoriametrics-data:/victoria-metrics-data
+    networks:
+      - rtccm-internal
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8428/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  otel-gateway:
+    <<: *common
+    image: cletrics/rtccm-otel-gateway:${RTCCM_VERSION:-latest}
+    container_name: rtccm-otel-gateway
+    # Select config file baked into image via RTCCM_OTEL_GATEWAY_CONFIG.
+    # Default: gateway-config.yaml (standard VictoriaMetrics-only pipeline).
+    # When RTCCM_OTEL_DIRECT_CH=true, set RTCCM_OTEL_GATEWAY_CONFIG=gateway-config-direct-ch.yaml
+    # to activate the ClickHouse direct export pipeline.
+    command: ["--config=/etc/otel/${RTCCM_OTEL_GATEWAY_CONFIG:-gateway-config.yaml}"]
+    environment:
+      RTCCM_OTEL_DIRECT_CH: ${RTCCM_OTEL_DIRECT_CH:-false}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-rtccm}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-rtccm}
+    volumes:
+      - tls-certs:/certs:ro
+    networks:
+      - rtccm-internal
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+      cert-manager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "components"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  clickhouse:
+    <<: *common
+    image: cletrics/rtccm-clickhouse:${RTCCM_VERSION:-latest}
+    container_name: rtccm-clickhouse
+    env_file:
+      - .secrets.env
+    secrets:
+      - clickhouse_password
+      - clickhouse_encryption_key
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    networks:
+      - rtccm-internal
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  clickhouse-etl:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "services.clickhouse_etl.etl"]
+    container_name: rtccm-clickhouse-etl
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      ETL_INTERVAL_SECONDS: "60"
+      ETL_BATCH_SIZE: "5000"
+      HEALTH_PORT: "8088"
+    networks:
+      - rtccm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # Infracost Cloud Pricing API (self-hosted)
+  # Source: https://github.com/infracost/cloud-pricing-api
+  # Provides 3M+ prices across AWS, Azure, GCP via GraphQL
+  infracost-api:
+    <<: *common
+    image: infracost/cloud-pricing-api:latest
+    container_name: rtccm-infracost-api
+    env_file:
+      - .secrets.env
+    environment:
+      INFRACOST_API_KEY: ${INFRACOST_API_KEY:-}
+      SELF_HOSTED_INFRACOST_API_KEY: ${INFRACOST_SELF_HOSTED_KEY:-}
+      POSTGRES_HOST: infracost-db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: infracost
+      POSTGRES_USER: infracost
+      POSTGRES_PASSWORD: ${INFRACOST_DB_PASSWORD:?INFRACOST_DB_PASSWORD must be set}
+      # Ticket #45: Self-refresh replaces infracost-cron container
+      PRICING_REFRESH_INTERVAL: "604800"
+    networks:
+      - rtccm-internal
+    depends_on:
+      infracost-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+
+  # Dedicated PostgreSQL for Infracost pricing data (3M+ rows)
+  infracost-db:
+    <<: *common
+    image: postgres:16-alpine
+    container_name: rtccm-infracost-db
+    env_file:
+      - .secrets.env
+    environment:
+      POSTGRES_DB: infracost
+      POSTGRES_USER: infracost
+      POSTGRES_PASSWORD: ${INFRACOST_DB_PASSWORD:?INFRACOST_DB_PASSWORD must be set}
+    volumes:
+      - infracost-postgres-data:/var/lib/postgresql/data
+    networks:
+      - rtccm-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U infracost -d infracost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  # infracost-cron: CONSOLIDATED into infracost-api (Ticket #45)
+  # The infracost-api container now handles its own weekly pricing refresh
+  # via the PRICING_REFRESH_INTERVAL env var, eliminating the need for a
+  # separate cron container. The /update endpoint is called internally.
+  # To restore standalone cron behavior, uncomment below:
+  # infracost-cron:
+  #   <<: *common
+  #   image: infracost/cloud-pricing-api:latest
+  #   container_name: rtccm-infracost-cron
+  #   entrypoint: ["sh", "-c", "while true; do sleep 604800; wget -qO- http://infracost-api:4000/update; done"]
+  #   networks:
+  #     - rtccm-internal
+  #   depends_on:
+  #     infracost-api:
+  #       condition: service_healthy
+
+  # Alerting topology (default local/customer path): co-located.
+  # `analytics-service` runs pricing-sidecar + cost-engine + anomaly-detector as one container
+  # while preserving the legacy internal aliases and health ports.
+  #
+  # To simulate the isolated ECS topology used by Terraform, combine this file with
+  # `docker-compose.alerting-isolated.yml` and scale `analytics-service` to 0.
+  analytics-service:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "analytics_service.main"]
+    container_name: rtccm-analytics-service
+    env_file:
+      - .secrets.env
+    volumes:
+      - rtccm-config:/app/config
+    environment:
+      RTCCM_ALERTING_TOPOLOGY: "co-located"
+      DATABASE_URL: ${DATABASE_URL}
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      CALCULATION_INTERVAL_SECONDS: "60"
+      # Set RTCCM_REALTIME_MODE=true to run cost-engine at 30s (overrides CALCULATION_INTERVAL_SECONDS)
+      # RTCCM_REALTIME_MODE: "false"
+      DETECTION_INTERVAL_SECONDS: "300"
+      REFRESH_INTERVAL_HOURS: "24"
+      INFRACOST_API_URL: http://infracost-api:4000/graphql
+      INFRACOST_API_KEY: ${INFRACOST_API_KEY:-}
+      INFRACOST_CACHE_TTL: "3600"
+      INFRACOST_CACHE_MAX_SIZE: "50000"
+      INFRACOST_SYNC_INTERVAL_HOURS: "168"
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+      # Cost Annotator (Ticket #1276) — real-time cost estimation sidecar
+      # Set COST_ANNOTATOR_ENABLED=true to activate (disabled by default)
+      COST_ANNOTATOR_ENABLED: "false"
+      COST_ANNOTATOR_INTERVAL_SECONDS: "30"
+    secrets:
+      - azure_credentials
+      - aws_credentials
+      - gcp_credentials
+    networks:
+      rtccm-internal:
+        aliases:
+          - pricing-sidecar
+          - cost-engine
+          - anomaly-detector
+      rtccm-external: {}
+    labels:
+      com.rtccm.alerting-topology: "co-located"
+      com.rtccm.alerting-services: "pricing-sidecar,cost-engine,anomaly-detector"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      victoriametrics:
+        condition: service_healthy
+      infracost-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request, os; urllib.request.urlopen('http://127.0.0.1:8081/health'); urllib.request.urlopen('http://127.0.0.1:8082/health'); urllib.request.urlopen('http://127.0.0.1:8083/health'); os.environ.get('COST_ANNOTATOR_ENABLED','false').lower()=='true' and urllib.request.urlopen('http://127.0.0.1:8089/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  k8s-cost-allocator:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "k8s_cost_allocator.main"]
+    container_name: rtccm-k8s-cost-allocator
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      ALLOCATION_INTERVAL_SECONDS: "300"
+      HEALTH_PORT: "8080"
+      # TLS (Phase 12.2)
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+    networks:
+      - rtccm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      victoriametrics:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  grafana:
+    <<: *common
+    image: cletrics/rtccm-grafana:${RTCCM_VERSION:-latest}
+    container_name: rtccm-grafana
+    entrypoint: ["/entrypoint/grafana-entrypoint.sh"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/overview.json
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-WEBAUTH-USER
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_SERVER_DOMAIN: ${RTCCM_HOST:-localhost}
+      GF_SERVER_ROOT_URL: "http://${RTCCM_HOST:-localhost}:${WEB_PORT:-5173}/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # SMTP — disabled by default; set SMTP_ENABLED=true in .env to activate
+      GF_SMTP_ENABLED: "${SMTP_ENABLED:-false}"
+      GF_SMTP_HOST: "${SMTP_HOST:-localhost}:${SMTP_PORT:-587}"
+      GF_SMTP_USER: "${SMTP_USER:-}"
+      GF_SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      GF_SMTP_FROM_ADDRESS: "${SMTP_FROM_ADDRESS:-noreply@rtccm.local}"
+      GF_SMTP_FROM_NAME: "RTCCM Alerts"
+      GF_SMTP_STARTTLS_POLICY: OpportunisticStartTLS
+    secrets:
+      - source: grafana_admin_password
+        mode: 0444
+      - source: clickhouse_password
+        mode: 0444
+      - source: postgres_password
+        mode: 0444
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - tls-certs:/certs:ro
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    # Port 3000 intentionally NOT exposed to host — access Grafana only through nginx
+    # to prevent auth proxy header injection bypass. Uncomment for debugging:
+    # ports:
+    #   - "${RTCCM_GRAFANA_PORT:-${GRAFANA_PORT:-3000}}:3000"
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      cert-manager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  api:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    container_name: rtccm-api
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      PORT: "8000"
+      VAULT_PASSPHRASE: ${VAULT_PASSPHRASE:-}
+      RTCCM_CONFIG_DIR: /app/config
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL}
+      # TLS (Phase 12.2 + Ticket #223: auto-managed certs)
+      TLS_CA_CERT_PATH: /certs/ca.pem
+      TLS_CERT_PATH: /certs/api.pem
+      TLS_KEY_PATH: /certs/api-key.pem
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+      LICENSE_SERVICE_URL: http://license-service:8001
+      LICENSE_TOKEN_PATH: /run/secrets/license_token
+      LICENSE_PUBLIC_KEY_PATH: /run/secrets/license_public_key.pem
+      TRIAL_TOKEN_FALLBACK_PATH: /app/config/license_token
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-gateway:4317
+      OTEL_SERVICE_NAME: rtccm-api
+      RTCCM_MFA_SKIP: "true"
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}"
+      # SMTP — for digest email delivery (Ticket #46)
+      SMTP_HOST: "${SMTP_HOST:-localhost}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      SMTP_FROM_ADDRESS: "${SMTP_FROM_ADDRESS:-noreply@rtccm.local}"
+      SMTP_USE_TLS: "${SMTP_USE_TLS:-true}"
+      # Self-hosted: bypass license validation, grant enterprise features
+      RTCCM_DEV_LICENSE_BYPASS: ${RTCCM_DEV_LICENSE_BYPASS:-true}
+    secrets:
+      - license_token
+      - source: license_public_key
+        target: license_public_key.pem
+      - grafana_admin_password
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      victoriametrics:
+        condition: service_healthy
+      license-service:
+        condition: service_healthy
+      cert-manager:
+        condition: service_healthy
+    volumes:
+      - rtccm-config:/app/config
+      - tls-certs:/certs:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  web:
+    <<: *common
+    image: cletrics/rtccm-web:${RTCCM_VERSION:-latest}
+    container_name: rtccm-web
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    ports:
+      - "${WEB_PORT:-5173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /run
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+
+  reconciliation-worker:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "reconciliation_engine.main"]
+    container_name: rtccm-reconciliation-worker
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+    networks:
+      - rtccm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      victoriametrics:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1024M
+
+  reconciliation-api:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "reconciliation_engine.dashboard_api"]
+    container_name: rtccm-reconciliation-api
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+    networks:
+      - rtccm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8084/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 512M
+
+  # --- Reconciliation Research Worker (optional, profile-gated) ---
+  # Ticket #529: Isolated self-improvement research, separate from production recon engine.
+  # SECURITY: When RTCCM_AI_MODE=disabled, this container should not be started.
+  # The 'research' profile gate prevents accidental startup.
+  # When AI is enabled, rtccm-external is required for external API egress.
+  recon-research-worker:
+    <<: *common
+    image: cletrics/rtccm-recon-research-worker:${RTCCM_VERSION:-latest}
+    container_name: rtccm-recon-research-worker
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      RTCCM_AI_MODE: ${RTCCM_AI_MODE:-disabled}
+      RTCCM_RECON_SELF_IMPROVE_MODE: ${RTCCM_RECON_SELF_IMPROVE_MODE:-off}
+      RTCCM_OFFPREM_AI_POLICY: ${RTCCM_OFFPREM_AI_POLICY:-allowed}
+      SECRETS_BACKEND: ${SECRETS_BACKEND:-env}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      AZURE_KEYVAULT_URL: ${AZURE_KEYVAULT_URL:-}
+      RESEARCH_SCHEDULE_CRON: ${RESEARCH_SCHEDULE_CRON:-0 6 * * *}
+      RESEARCH_QUIET_HOURS_START: "1"
+      RESEARCH_QUIET_HOURS_END: "5"
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      postgres:
+        condition: service_healthy
+      victoriametrics:
+        condition: service_healthy
+    profiles:
+      - research
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  license-service:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "license_service.main"]
+    container_name: rtccm-license-service
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      PORT: "8001"
+      # TLS (Phase 12.2)
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+    networks:
+      - rtccm-internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - source: license_private_key
+        target: license_private_key.pem
+      - source: license_public_key
+        target: license_public_key.pem
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # --- Cloud Collectors (profile-gated) ---
+
+  otel-collector-azure:
+    <<: *common
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    container_name: rtccm-otel-azure
+    command: ["--config=/etc/otel/azure-config.yaml"]
+    volumes:
+      - ./collector-config/azure/otel-config.yaml:/etc/otel/azure-config.yaml:ro
+      - tls-certs:/certs:ro  # Ticket #223: auto-managed certs
+    env_file:
+      - .secrets.env
+    environment:
+      AZURE_SUBSCRIPTION_ID: ${RTCCM_AZURE_SUBSCRIPTION_ID}
+      AZURE_TENANT_ID: ${RTCCM_AZURE_TENANT_ID}
+      AZURE_CLIENT_ID: ${RTCCM_AZURE_CLIENT_ID}
+      AZURE_CLIENT_SECRET: ${RTCCM_AZURE_CLIENT_SECRET}
+    secrets:
+      - azure_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      otel-gateway:
+        condition: service_healthy
+      cert-manager:
+        condition: service_healthy
+    profiles:
+      - azure
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "components"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # Azure Cost Collector -- uses Cost Management Query API (REST)
+  # Replaces the broken OTeL azuremonitor receiver for cost data.
+  # The SP only has Cost Management Reader, which is sufficient for this API.
+  azure-cost-collector:
+    <<: *common
+    image: cletrics/rtccm-azure-collector:${RTCCM_VERSION:-latest}
+    container_name: rtccm-azure-cost-collector
+    env_file:
+      - .secrets.env
+    environment:
+      AZURE_SUBSCRIPTION_ID: ${RTCCM_AZURE_SUBSCRIPTION_ID}
+      AZURE_SUBSCRIPTION_IDS: ${RTCCM_AZURE_SUBSCRIPTION_IDS:-${RTCCM_AZURE_SUBSCRIPTION_ID}}
+      AZURE_TENANT_ID: ${RTCCM_AZURE_TENANT_ID}
+      AZURE_CLIENT_ID: ${RTCCM_AZURE_CLIENT_ID}
+      AZURE_CLIENT_SECRET: ${RTCCM_AZURE_CLIENT_SECRET}
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      COLLECT_INTERVAL_SECONDS: "900"
+      AZURE_QUERY_DELAY_SECONDS: "300"
+      AZURE_COST_TYPE: "AmortizedCost"
+      # TLS (Phase 12.2)
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    profiles:
+      - azure
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8085/')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # AWS Cost Collector -- uses Cost Explorer API with IAM credentials
+  # Supports multi-account: provide a JSON array in aws_credentials.json
+  # Each account collected independently, metrics tagged with account_id
+  aws-cost-collector:
+    <<: *common
+    image: cletrics/rtccm-aws-collector:${RTCCM_VERSION:-latest}
+    container_name: rtccm-aws-cost-collector
+    env_file:
+      - .secrets.env
+    environment:
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      COLLECT_INTERVAL_SECONDS: "900"
+      # Single-account fallback (used when aws_credentials.json is absent)
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCOUNT_ID: ${AWS_ACCOUNT_ID:-}
+      # TLS (Phase 12.2)
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+    secrets:
+      - aws_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    profiles:
+      - aws
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8086/')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # --- Kubernetes Cost Allocation (Ticket #1293) ---
+  # Performs hourly attribution of node costs to namespaces and pods.
+# #   k8s-cost-allocator:
+# #     <<: *common
+# #     image: cletrics/rtccm-k8s-cost-allocator:${RTCCM_VERSION:-latest}
+# #     build:
+# #       context: .
+# #       dockerfile: services/k8s-cost-allocator/Dockerfile
+# #     container_name: rtccm-k8s-cost-allocator
+# #     environment:
+# #       DATABASE_URL: postgresql://rtccm:rtccm@postgres:5432/rtccm
+# #       VICTORIAMETRICS_URL: http://victoriametrics:8428
+# #       ALLOCATION_INTERVAL_SECONDS: "3600"
+# #     networks:
+# #       - rtccm-internal
+# #     depends_on:
+# #       postgres:
+# #         condition: service_healthy
+# #       victoriametrics:
+# #         condition: service_healthy
+# #     deploy:
+#       resources:
+#         limits:
+#           cpus: "0.5"
+#           memory: 256M
+# 
+  # --- Multi-Cloud Change Event Ingest Pipeline (Ticket #1301) ---
+  # Polls CloudTrail, Azure Activity Log, and GCP Audit Logs for RCA data.
+  change-event-collector:
+    <<: *common
+    image: cletrics/rtccm-change-event-collector:${RTCCM_VERSION:-latest}
+    container_name: rtccm-change-event-collector
+    profiles:
+      - change-events
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: postgresql://rtccm:rtccm@postgres:5432/rtccm
+      POLL_INTERVAL_SECONDS: "300"
+      HEALTH_PORT: "8095"
+      ENABLE_AWS_CHANGE_EVENTS: ${ENABLE_AWS_CHANGE_EVENTS:-true}
+      ENABLE_AZURE_CHANGE_EVENTS: ${ENABLE_AZURE_CHANGE_EVENTS:-true}
+      ENABLE_GCP_CHANGE_EVENTS: ${ENABLE_GCP_CHANGE_EVENTS:-true}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    secrets:
+      - aws_credentials
+      - azure_credentials
+      - gcp_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/health')\" || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # YACE (Yet Another CloudWatch Exporter) — scrapes AWS CloudWatch metrics
+  # Ticket #1009: Replaces crashing awscloudwatch OTel receiver
+  # Ticket #1018: Ensures aws_ec2_cpuutilization_average metric flows to VictoriaMetrics
+  aws-yace:
+    <<: *common
+    image: prometheuscommunity/yet-another-cloudwatch-exporter:v0.63.0
+    container_name: rtccm-aws-yace
+    entrypoint: ["/bin/sh", "/entrypoint/yace-entrypoint.sh"]
+    volumes:
+      - ./collector-config/aws/yace-config.yaml:/config/yace-config.yaml:ro
+      - ./collector-config/aws/yace-entrypoint.sh:/entrypoint/yace-entrypoint.sh:ro
+    secrets:
+      - aws_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    profiles:
+      - aws
+    healthcheck:
+      test: ["CMD", "/bin/yace", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  otel-collector-aws:
+    <<: *common
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    container_name: rtccm-otel-aws
+    command: ["--config=/etc/otel/aws-config.yaml"]
+    volumes:
+      - ./collector-config/aws/otel-config.yaml:/etc/otel/aws-config.yaml:ro
+      - tls-certs:/certs:ro  # Ticket #223: auto-managed certs
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    secrets:
+      - aws_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      otel-gateway:
+        condition: service_healthy
+      cert-manager:
+        condition: service_healthy
+      aws-yace:
+        condition: service_healthy
+    profiles:
+      - aws
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "components"]
+      interval: 30s
+      timeout: 10s
+      retries: 8
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  gcp-cost-collector:
+    <<: *common
+    image: cletrics/rtccm-gcp-collector:${RTCCM_VERSION:-latest}
+    container_name: rtccm-gcp-cost-collector
+    env_file:
+      - .secrets.env
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp_credentials
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      COLLECT_INTERVAL_SECONDS: "180"
+      # TLS (Phase 12.2)
+      TLS_ENABLED: ${TLS_ENABLED:-true}
+    secrets:
+      - gcp_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    profiles:
+      - gcp
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8087/')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  otel-collector-gcp:
+    <<: *common
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    container_name: rtccm-otel-gcp
+    command: ["--config=/etc/otel/gcp-config.yaml"]
+    volumes:
+      - ./collector-config/gcp/otel-config.yaml:/etc/otel/gcp-config.yaml:ro
+      - tls-certs:/certs:ro  # Ticket #223: auto-managed certs
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp_credentials
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID}
+    secrets:
+      - gcp_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      otel-gateway:
+        condition: service_healthy
+      cert-manager:
+        condition: service_healthy
+    profiles:
+      - gcp
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "components"]
+      interval: 30s
+      timeout: 10s
+      retries: 8
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # FOCUS ETL services — unified dispatcher with --provider flag (Ticket #613)
+  # Each provider runs as a separate container (profile-gated) using the unified image.
+  focus-etl-aws:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "services.focus_etl.main", "--provider", "aws"]
+    container_name: rtccm-focus-etl-aws
+    env_file:
+      - .secrets.env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL}
+      AWS_CUR_S3_BUCKET: ${AWS_CUR_S3_BUCKET}
+      AWS_CUR_S3_PREFIX: ${AWS_CUR_S3_PREFIX}
+      AWS_CUR_REPORT_NAME: ${AWS_CUR_REPORT_NAME}
+      AWS_REGION: ${AWS_REGION}
+      HEALTH_PORT: "8091"
+    secrets:
+      - aws_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    profiles:
+      - aws
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/')\" || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  focus-etl-gcp:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "services.focus_etl.main", "--provider", "gcp"]
+    container_name: rtccm-focus-etl-gcp
+    env_file:
+      - .secrets.env
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gcp_credentials
+      ETL_INTERVAL_SECONDS: "60"
+      ETL_BATCH_SIZE: "5000"
+      ETL_LOOKBACK_DAYS: "7"
+      HEALTH_PORT: "8089"
+    secrets:
+      - gcp_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    profiles:
+      - gcp
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  focus-etl-azure:
+    <<: *common
+    image: cletrics/rtccm-unified:${RTCCM_VERSION:-latest}
+    command: ["python", "-m", "services.focus_etl.main", "--provider", "azure"]
+    container_name: rtccm-focus-etl-azure
+    env_file:
+      - .secrets.env
+    environment:
+      AZURE_SUBSCRIPTION_ID: ${RTCCM_AZURE_SUBSCRIPTION_ID}
+      AZURE_SUBSCRIPTION_IDS: ${RTCCM_AZURE_SUBSCRIPTION_IDS:-${RTCCM_AZURE_SUBSCRIPTION_ID}}
+      AZURE_TENANT_ID: ${RTCCM_AZURE_TENANT_ID}
+      AZURE_CLIENT_ID: ${RTCCM_AZURE_CLIENT_ID}
+      AZURE_CLIENT_SECRET: ${RTCCM_AZURE_CLIENT_SECRET}
+      AZURE_COST_TYPE: ${AZURE_COST_TYPE:-ActualCost}
+      ETL_INTERVAL_SECONDS: "3600"
+      ETL_BATCH_SIZE: "5000"
+      ETL_LOOKBACK_DAYS: "7"
+      BACKFILL_MONTHS: "3"
+      HEALTH_PORT: "8090"
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      ENABLE_VM_FALLBACK: ${AZURE_FOCUS_ENABLE_VM_FALLBACK:-false}
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      victoriametrics:
+        condition: service_healthy
+    profiles:
+      - azure
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # OCI Real-Time Metrics Collector (Ticket #270)
+  oci-collector:
+    image: cletrics/rtccm-oci-collector:${RTCCM_VERSION:-latest}
+    container_name: rtccm-oci-collector
+    profiles:
+      - oci
+    environment:
+      OCI_CREDENTIALS_FILE: /run/secrets/oci_credentials
+      VICTORIAMETRICS_URL: http://victoriametrics:8428
+      COLLECT_INTERVAL_SECONDS: "60"
+      HEALTH_PORT: "8089"
+    secrets:
+      - oci_credentials
+    networks:
+      - rtccm-internal
+      - rtccm-external
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password.txt
+  azure_credentials:
+    file: ./secrets/azure_credentials.json
+  aws_credentials:
+    file: ./secrets/aws_credentials.json
+  gcp_credentials:
+    file: ./secrets/gcp_credentials.json
+  license_private_key:
+    file: ./secrets/license_private_key.pem
+  license_public_key:
+    file: ./secrets/license_public_key.pem
+  license_token:
+    file: ./secrets/license_token.txt
+  clickhouse_password:
+    file: ./secrets/clickhouse_password.txt
+  clickhouse_encryption_key:
+    file: ./secrets/clickhouse_encryption_key.txt
+  oci_credentials:
+    file: ./secrets/oci_credentials.json
+  # TLS certificates now managed by cert-manager service (Ticket #223)
+  # Certs are shared via the tls-certs Docker volume at /certs/
