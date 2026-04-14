@@ -113,18 +113,37 @@ if [ ! -f secrets/clickhouse_encryption_key.txt ] && grep -q "^CLICKHOUSE_ENCRYP
   green "Mirrored CLICKHOUSE_ENCRYPTION_KEY to secrets/clickhouse_encryption_key.txt"
 fi
 
-# License token placeholder (customers receive this from cletrics sales)
+# License RSA keypair — license-service uses this to sign trial tokens
+# on first run; API reads the public key to verify tokens offline.
+if [ ! -f secrets/license_private_key.pem ]; then
+  openssl genrsa -out secrets/license_private_key.pem 2048 2>/dev/null
+  chmod 600 secrets/license_private_key.pem
+  green "Generated secrets/license_private_key.pem"
+fi
+if [ ! -f secrets/license_public_key.pem ]; then
+  openssl rsa -in secrets/license_private_key.pem -pubout -out secrets/license_public_key.pem 2>/dev/null
+  chmod 644 secrets/license_public_key.pem
+  green "Generated secrets/license_public_key.pem"
+fi
+
+# License token placeholder. On first api startup the middleware calls
+# license-service /licenses/trial to mint a signed 30-day trial token and
+# writes it to /app/config/license_token (persistent volume). Paid customers
+# overwrite this file with a token from cletrics sales.
 if [ ! -f secrets/license_token.txt ]; then
   echo "trial" > secrets/license_token.txt
   chmod 600 secrets/license_token.txt
-  yellow "secrets/license_token.txt set to 'trial'. Replace with your licensed token to unlock paid features."
+  yellow "secrets/license_token.txt set to 'trial'. API will auto-bootstrap a signed trial token on first startup."
 fi
 
-# Cloud credential placeholders (only used if you run the relevant profile)
-for f in aws_credentials.json azure_credentials.json gcp_credentials.json; do
+# Cloud credential placeholders (only used if you run the relevant profile).
+# Include oci even though we ship no cletrics/rtccm-oci-collector image —
+# compose references the secret at boot and fails on missing path.
+for f in aws_credentials.json azure_credentials.json gcp_credentials.json oci_credentials.json; do
   [ -f "secrets/$f" ] || echo '{}' > "secrets/$f"
 done
-chmod 600 secrets/*.json secrets/*.txt secrets/*.bin 2>/dev/null || true
+chmod 600 secrets/*.json secrets/*.txt 2>/dev/null || true
+chmod 644 secrets/license_public_key.pem 2>/dev/null || true
 
 # ─── Pull and start ─────────────────────────────────────────────────────────
 green "Pulling cletrics/rtccm-* images from Docker Hub..."
