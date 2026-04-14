@@ -104,13 +104,13 @@ if [ ! -f secrets/clickhouse_password.txt ] && grep -q "^CLICKHOUSE_PASSWORD=" .
   green "Mirrored CLICKHOUSE_PASSWORD to secrets/clickhouse_password.txt"
 fi
 
-# Mirror encryption key (hex → raw bytes) via python3 so we don't depend on xxd
-# which is not installed on minimal Ubuntu/Debian.
-if [ ! -f secrets/clickhouse_encryption_key.bin ] && grep -q "^CLICKHOUSE_ENCRYPTION_KEY=" .secrets.env; then
-  HEX_KEY="$(grep "^CLICKHOUSE_ENCRYPTION_KEY=" .secrets.env | cut -d= -f2-)"
-  python3 -c "import sys; open('secrets/clickhouse_encryption_key.bin','wb').write(bytes.fromhex('$HEX_KEY'.strip()))"
-  chmod 600 secrets/clickhouse_encryption_key.bin
-  green "Mirrored CLICKHOUSE_ENCRYPTION_KEY to secrets/clickhouse_encryption_key.bin"
+# Mirror encryption key to clickhouse_encryption_key.txt (ASCII hex form —
+# the compose file mounts this path as a docker secret and ClickHouse decodes
+# the hex internally).
+if [ ! -f secrets/clickhouse_encryption_key.txt ] && grep -q "^CLICKHOUSE_ENCRYPTION_KEY=" .secrets.env; then
+  grep "^CLICKHOUSE_ENCRYPTION_KEY=" .secrets.env | cut -d= -f2- > secrets/clickhouse_encryption_key.txt
+  chmod 600 secrets/clickhouse_encryption_key.txt
+  green "Mirrored CLICKHOUSE_ENCRYPTION_KEY to secrets/clickhouse_encryption_key.txt"
 fi
 
 # License token placeholder (customers receive this from cletrics sales)
